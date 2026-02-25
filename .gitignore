@@ -1,0 +1,21 @@
+# 忽略 Gemini/Claude 配置目录
+.claude/
+.gemini/
+
+# 忽略 skills 目录
+skills-main/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# 构建产物
+dist/
+
+# 上传/输出的临时视频文件
+v1.0/HighlightCutter/uploads/
+v1.0/HighlightCutter/outputs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
