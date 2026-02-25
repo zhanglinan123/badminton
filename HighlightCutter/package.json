@@ -1,0 +1,38 @@
+{
+  "name": "HighlightCutter",
+  "version": "1.0.0",
+  "description": "Video trimming and merging tool",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev:server": "nodemon server.js",
+    "dev:ui": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.58.2",
+    "axios": "^1.13.5",
+    "clsx": "^2.1.1",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "framer-motion": "^12.34.3",
+    "lucide-react": "^0.575.0",
+    "multer": "^1.4.5-lts.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-hot-toast": "^2.6.0",
+    "tailwind-merge": "^3.5.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "autoprefixer": "^10.4.24",
+    "nodemon": "^3.0.1",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}
