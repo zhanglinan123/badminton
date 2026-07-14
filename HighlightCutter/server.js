@@ -4,6 +4,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const crypto = require('crypto');
+const { execFile } = require('child_process');
 
 const app = express();
 const PORT = 3000;
@@ -11,6 +13,288 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 app.use(express.static('dist'));
+
+const sourceVideoDir = String.raw`E:\我的照片\羽毛球视频\原片`;
+const aiPredictionRoot = path.resolve(__dirname, '..', 'TrackNetV3', 'prediction', 'baseline');
+const motionModelPath = path.join(aiPredictionRoot, 'motion_model.json');
+const videoExtensions = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']);
+const reviewReasons = new Set([
+  'start_too_early', 'start_too_late', 'end_too_early',
+  'end_too_late', 'merged_rallies', 'not_a_rally',
+]);
+const ffmpegPath = process.env.FFMPEG_PATH || String.raw`C:\Users\39249\anaconda3\envs\tracknet\lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win64-v4.2.2.exe`;
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+function isVideoFile(filename) {
+  return videoExtensions.has(path.extname(filename).toLowerCase());
+}
+
+function probeVideo(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, ['-hide_banner', '-i', filePath], { windowsHide: true }, (error, stdout, stderr) => {
+      const fpsMatch = stderr.match(/(\d+(?:\.\d+)?)\s*fps\b/);
+      const durationMatch = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!fpsMatch || !durationMatch) return reject(error || new Error('无法读取视频元数据'));
+      const duration = Number(durationMatch[1]) * 3600
+        + Number(durationMatch[2]) * 60 + Number(durationMatch[3]);
+      resolve({ fps: Number(fpsMatch[1]), duration });
+    });
+  });
+}
+
+function modelFingerprint() {
+  if (!fs.existsSync(motionModelPath)) return null;
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(motionModelPath)).digest('hex');
+  return `sha256:${digest}`;
+}
+
+function annotationFilename(videoFilename) {
+  return `${path.basename(videoFilename, path.extname(videoFilename))}.annotations.json`;
+}
+
+function reviewFilename(videoFilename) {
+  return `${path.basename(videoFilename, path.extname(videoFilename))}.review.json`;
+}
+
+function readAnnotation(videoFilename) {
+  const filename = annotationFilename(videoFilename);
+  const annotationPath = path.join(sourceVideoDir, filename);
+  if (!fs.existsSync(annotationPath)) {
+    return { status: 'unannotated', count: 0, annotations: [] };
+  }
+
+  try {
+    const payload = JSON.parse(fs.readFileSync(annotationPath, 'utf8'));
+    const annotations = Array.isArray(payload.annotations) ? payload.annotations : [];
+    return { status: 'annotated', count: annotations.length, annotations };
+  } catch (error) {
+    console.error(`[source-videos] 标注文件解析失败: ${annotationPath}`, error.message);
+    return { status: 'invalid', count: 0, annotations: [] };
+  }
+}
+
+function readAiPrediction(videoFilename) {
+  const stem = path.basename(videoFilename, path.extname(videoFilename));
+  const predictionPath = path.join(aiPredictionRoot, stem, 'rallies_ai.json');
+  if (!fs.existsSync(predictionPath)) {
+    return { status: 'unavailable', count: 0, predictions: [] };
+  }
+
+  try {
+    const payload = JSON.parse(fs.readFileSync(predictionPath, 'utf8'));
+    const predictions = (Array.isArray(payload) ? payload : [])
+      .map(item => ({
+        start_seconds: Number(item.start ?? item.start_seconds),
+        end_seconds: Number(item.end ?? item.end_seconds),
+        hit_count: Number(item.hit_count || 0),
+        confidence: Number(item.confidence ?? 0),
+      }))
+      .filter(item => Number.isFinite(item.start_seconds)
+        && Number.isFinite(item.end_seconds)
+        && item.end_seconds > item.start_seconds);
+    return { status: 'available', count: predictions.length, predictions };
+  } catch (error) {
+    console.error(`[source-videos] AI 预测文件解析失败: ${predictionPath}`, error.message);
+    return { status: 'invalid', count: 0, predictions: [] };
+  }
+}
+
+function readReview(videoFilename) {
+  const reviewPath = path.join(sourceVideoDir, reviewFilename(videoFilename));
+  if (!fs.existsSync(reviewPath)) return { issues: [], accepted: [] };
+  try {
+    const payload = JSON.parse(fs.readFileSync(reviewPath, 'utf8'));
+    const issues = (Array.isArray(payload.issues) ? payload.issues : [])
+      .map(issue => ({
+        start_seconds: issue.start_seconds,
+        end_seconds: issue.end_seconds,
+        reasons: Array.isArray(issue.reasons)
+          ? issue.reasons
+          : reviewReasons.has(issue.reason) ? [issue.reason] : [],
+        confidence: issue.confidence,
+        hit_count: issue.hit_count,
+        reviewed_at: issue.reviewed_at || issue.reported_at,
+      }))
+      .filter(issue => issue.reasons.length > 0);
+    const accepted = (Array.isArray(payload.accepted) ? payload.accepted : []).map(item => ({
+      start_seconds: item.start_seconds,
+      end_seconds: item.end_seconds,
+      confidence: item.confidence,
+      hit_count: item.hit_count,
+      reviewed_at: item.reviewed_at,
+    }));
+    return {
+      issues,
+      accepted,
+      complete: payload.review_complete === true,
+    };
+  } catch (error) {
+    console.error(`[source-videos] 验收记录解析失败: ${reviewPath}`, error.message);
+    return { issues: [], accepted: [] };
+  }
+}
+
+app.get('/api/source-videos', async (req, res) => {
+  try {
+    if (!fs.existsSync(sourceVideoDir)) {
+      return res.status(404).json({ error: `视频目录不存在: ${sourceVideoDir}` });
+    }
+
+    const entries = fs.readdirSync(sourceVideoDir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && isVideoFile(entry.name));
+    const fingerprint = modelFingerprint();
+    const videos = (await Promise.all(entries.map(async entry => {
+        const annotation = readAnnotation(entry.name);
+        const aiPrediction = readAiPrediction(entry.name);
+        const review = readReview(entry.name);
+        const filePath = path.join(sourceVideoDir, entry.name);
+        const metadata = await probeVideo(filePath);
+        return {
+          name: entry.name,
+          url: `/source-videos/${encodeURIComponent(entry.name)}`,
+          size_bytes: fs.statSync(filePath).size,
+          fps: metadata.fps,
+          duration_seconds: metadata.duration,
+          annotation_status: annotation.status,
+          annotation_count: annotation.count,
+          annotations: annotation.annotations,
+          ai_status: aiPrediction.status,
+          ai_count: aiPrediction.count,
+          ai_predictions: aiPrediction.predictions,
+          model_fingerprint: fingerprint,
+          review_issue_count: review.issues.length,
+          review_issues: review.issues,
+          review_accepted_count: review.accepted.length,
+          review_accepted: review.accepted,
+          review_complete: review.complete,
+        };
+      })))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({ directory: sourceVideoDir, videos });
+  } catch (error) {
+    console.error('[source-videos] 读取失败:', error.message);
+    res.status(500).json({ error: '读取视频目录失败' });
+  }
+});
+
+app.get('/source-videos/:filename', (req, res) => {
+  const filename = req.params.filename;
+  if (filename !== path.basename(filename) || !isVideoFile(filename)) {
+    return res.status(400).json({ error: '非法视频文件名' });
+  }
+
+  const filePath = path.join(sourceVideoDir, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: '视频文件不存在' });
+  }
+  res.sendFile(filePath);
+});
+
+app.post('/api/annotations', async (req, res) => {
+  const payload = req.body || {};
+  const sourceVideo = payload.source_video;
+  if (typeof sourceVideo !== 'string' || sourceVideo !== path.basename(sourceVideo) || !isVideoFile(sourceVideo)) {
+    return res.status(400).json({ error: 'source_video 必须是目录中的视频文件名' });
+  }
+
+  const videoPath = path.join(sourceVideoDir, sourceVideo);
+  if (!fs.existsSync(videoPath)) {
+    return res.status(404).json({ error: '源视频不存在' });
+  }
+
+  const annotationPath = path.join(sourceVideoDir, annotationFilename(sourceVideo));
+  const tempPath = `${annotationPath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    const metadata = await probeVideo(videoPath);
+    const savedPayload = { ...payload, fps: metadata.fps };
+    fs.writeFileSync(tempPath, JSON.stringify(savedPayload, null, 2), 'utf8');
+    fs.renameSync(tempPath, annotationPath);
+    res.json({
+      success: true,
+      source_video: sourceVideo,
+      annotation_file: path.basename(annotationPath),
+      annotation_count: Array.isArray(payload.annotations) ? payload.annotations.length : 0,
+      fps: metadata.fps,
+    });
+  } catch (error) {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    console.error('[annotations] 保存失败:', error.message);
+    res.status(500).json({ error: '保存标注失败' });
+  }
+});
+
+app.post('/api/review-issues', async (req, res) => {
+  const payload = req.body || {};
+  const sourceVideo = payload.source_video;
+  if (typeof sourceVideo !== 'string' || sourceVideo !== path.basename(sourceVideo) || !isVideoFile(sourceVideo)) {
+    return res.status(400).json({ error: 'source_video 必须是目录中的视频文件名' });
+  }
+  if (!fs.existsSync(path.join(sourceVideoDir, sourceVideo))) {
+    return res.status(404).json({ error: '源视频不存在' });
+  }
+  const issues = Array.isArray(payload.issues) ? payload.issues : [];
+  const accepted = Array.isArray(payload.accepted) ? payload.accepted : [];
+  if (issues.some(issue => !Number.isFinite(issue.start_seconds)
+      || !Number.isFinite(issue.end_seconds)
+      || issue.end_seconds <= issue.start_seconds
+      || !Array.isArray(issue.reasons)
+      || issue.reasons.length === 0
+      || issue.reasons.some(reason => !reviewReasons.has(reason)))) {
+    return res.status(400).json({ error: '问题片段时间区间无效' });
+  }
+  if (accepted.some(item => !Number.isFinite(item.start_seconds)
+      || !Number.isFinite(item.end_seconds)
+      || item.end_seconds <= item.start_seconds)) {
+    return res.status(400).json({ error: '正确片段时间区间无效' });
+  }
+
+  const reviewPath = path.join(sourceVideoDir, reviewFilename(sourceVideo));
+  const tempPath = `${reviewPath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    const aiPrediction = readAiPrediction(sourceVideo);
+    const metadata = await probeVideo(path.join(sourceVideoDir, sourceVideo));
+    const enrich = item => {
+      const prediction = aiPrediction.predictions.find(candidate =>
+        Math.abs(candidate.start_seconds - item.start_seconds) < 0.001
+        && Math.abs(candidate.end_seconds - item.end_seconds) < 0.001);
+      return {
+        ...item,
+        confidence: prediction?.confidence ?? null,
+        hit_count: prediction?.hit_count ?? null,
+        reviewed_at: item.reviewed_at || item.reported_at || new Date().toISOString(),
+      };
+    };
+    const enrichedIssues = issues.map(enrich).map(({ reported_at, ...issue }) => issue);
+    const enrichedAccepted = accepted.map(enrich).map(({ reported_at, ...item }) => item);
+    const reviewed = new Set([...enrichedIssues, ...enrichedAccepted]
+      .map(item => `${item.start_seconds}:${item.end_seconds}`));
+    const savedPayload = {
+      schema_version: 1,
+      source_video: sourceVideo,
+      fps: metadata.fps,
+      duration_seconds: metadata.duration,
+      model_fingerprint: modelFingerprint(),
+      ai_count: aiPrediction.count,
+      review_complete: aiPrediction.count > 0 && reviewed.size === aiPrediction.count,
+      updated_at: new Date().toISOString(),
+      issues: enrichedIssues,
+      accepted: enrichedAccepted,
+    };
+    fs.writeFileSync(tempPath, JSON.stringify(savedPayload, null, 2), 'utf8');
+    fs.renameSync(tempPath, reviewPath);
+    res.json({
+      success: true,
+      issue_count: enrichedIssues.length,
+      accepted_count: enrichedAccepted.length,
+      review_complete: savedPayload.review_complete,
+    });
+  } catch (error) {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    console.error('[review-issues] 保存失败:', error.message);
+    res.status(500).json({ error: '保存验收记录失败' });
+  }
+});
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -40,6 +324,22 @@ const upload = multer({
     }
   }
   // 不设置 fileSize 限制，支持任意大小的视频文件
+});
+
+app.post('/api/video-metadata', upload.single('video'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: '未上传视频文件' });
+  }
+
+  try {
+    const metadata = await probeVideo(req.file.path);
+    res.json(metadata);
+  } catch (error) {
+    console.error('[video-metadata] 探测失败:', error.message);
+    res.status(400).json({ error: `无法读取视频 FPS: ${error.message}` });
+  } finally {
+    cleanupFile(req.file.path);
+  }
 });
 
 const outputDir = 'outputs';
